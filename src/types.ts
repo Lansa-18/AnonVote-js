@@ -309,3 +309,22 @@ export interface VoteReceipt {
   /** Whether the vote has been verified. */
   verified: boolean;
 }
+
+// ── ZKP & Homomorphic Encryption Types ────────────────────────────────────────
+
+export type {
+  PaillierPublicKey,
+  PaillierPrivateKey,
+  PaillierKeyPair,
+  PaillierCiphertext,
+  HomomorphicEncryptedVote,
+  BinaryValidityProof,
+  BallotValidityProof,
+  TallyDecryptionProof,
+  ThresholdKeyShare,
+  PartialDecryptionShare,
+  ThresholdDecryptionResult,
+  MerkleProof,
+  MerkleTreeCommitment,
+  ZKPVerificationReport,
+} from "./zkp/types";

@@ -29,12 +29,14 @@
     "docs": "typedoc",
     "prepublishOnly": "npm run build && npm test",
     "typecheck:bench": "tsc -p tsconfig.benchmarks.json",
-    "bench": "npm run bench:encrypt && npm run bench:decrypt && npm run bench:hash && npm run bench:token && npm run bench:perf-hooks",
+    "bench": "npm run bench:encrypt && npm run bench:decrypt && npm run bench:hash && npm run bench:token && npm run bench:perf-hooks && npm run bench:zkp-tally",
     "bench:encrypt": "tsx benchmarks/encrypt.bench.ts",
     "bench:decrypt": "tsx benchmarks/decrypt.bench.ts",
     "bench:hash": "tsx benchmarks/hash.bench.ts",
     "bench:token": "tsx benchmarks/generateToken.bench.ts",
     "bench:perf-hooks": "tsx benchmarks/perf-hooks.bench.ts",
+    "bench:zkp-tally": "tsx benchmarks/zkp-tally.bench.ts",
+    "bench:homomorphic": "tsx benchmarks/homomorphic.bench.ts",
     "bench:memory": "node --expose-gc --import tsx benchmarks/memory-profile.ts"
   },
   "keywords": [
