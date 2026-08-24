@@ -36,7 +36,7 @@ export async function main(): Promise<void> {
 
   // Step 1: Election Setup & Key Generation
   console.log("1. Setting up election & generating Paillier homomorphic keypair...");
-  const keyPair = generatePaillierKeyPair(256);
+  const keyPair = generatePaillierKeyPair(2048);
   console.log(`   Public Modulus n: ${keyPair.publicKey.n.slice(0, 32)}... (${keyPair.publicKey.bits} bits)`);
 
   const electionId = "elec-governance-2026-q3";

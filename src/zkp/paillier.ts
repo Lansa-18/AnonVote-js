@@ -35,11 +35,12 @@ export function paillierL(u: bigint, n: bigint): bigint {
 }
 
 /**
- * Generates a Paillier key pair of specified bit length (e.g. 512, 1024, 2048, 3072).
+ * Generates a Paillier key pair of specified bit length (e.g. 2048, 3072, 4096).
  *
- * @param bits - Key length in bits (default 512 for fast browser/testing, 2048 for high-security production).
+ * @param bits - Key length in bits (default 2048 for production security; smaller sizes like 128/256/512 only for fast testing).
+ * @throws {ValidationError} If bits < 64.
  */
-export function generatePaillierKeyPair(bits = 512): PaillierKeyPair {
+export function generatePaillierKeyPair(bits = 2048): PaillierKeyPair {
   if (bits < 64) {
     throw new ValidationError("Paillier key bit length must be at least 64 bits");
   }
