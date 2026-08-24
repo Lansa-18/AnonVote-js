@@ -12,30 +12,109 @@ export {
   hashToken,
   encryptVote,
   decryptVote,
+  verifyVoteHash,
+  verifyVoteProof,
+  encryptVoteHomomorphic,
+  verifyVoteZKP,
+  tallyHomomorphic,
+  verifyHomomorphicTallyProof,
 } from "./crypto";
+
+// ZKP and Homomorphic Subsystem
+export {
+  // Math
+  mod,
+  gcd,
+  lcm,
+  extendedGcd,
+  modInverse,
+  modPow,
+  hexToBigInt,
+  bigIntToHex,
+  randomBigInt,
+  randomCoprime,
+  isProbablePrime,
+  generatePrime,
+  // Paillier
+  paillierL,
+  generatePaillierKeyPair,
+  encryptPaillier,
+  decryptPaillier,
+  addPaillier,
+  aggregatePaillier,
+  multiplyPaillier,
+  // Pedersen
+  generatePedersenParams,
+  commitPedersen,
+  verifyPedersenCommitment,
+  addPedersenCommitments,
+  // ZKP Proofs
+  generateBinaryValidityProof,
+  verifyBinaryValidityProof,
+  createHomomorphicVote,
+  verifyHomomorphicVote,
+  tallyHomomorphicVotes,
+  verifyTallyDecryptionProof,
+  // Threshold
+  generateThresholdKeyShares,
+  generatePartialDecryption,
+  combineThresholdDecryptions,
+  // Merkle
+  buildMerkleTree,
+  generateMerkleProof,
+  verifyMerkleProof,
+} from "./zkp";
+export type {
+  PaillierPublicKey,
+  PaillierPrivateKey,
+  PaillierKeyPair,
+  PaillierCiphertext,
+  HomomorphicEncryptedVote,
+  BinaryValidityProof,
+  BallotValidityProof,
+  TallyDecryptionProof,
+  ThresholdKeyShare,
+  PartialDecryptionShare,
+  ThresholdDecryptionResult,
+  MerkleProof,
+  MerkleTreeCommitment,
+  ZKPVerificationReport,
+  PedersenParams,
+  PedersenCommitment,
+} from "./zkp";
+
+// Helper utilities
+export { bytesToBase64Url } from "./utils";
+
+// Retry utility
+export {
+  withRetry,
+  resolveRetryConfig,
+  calculateDelay,
+  HttpError,
+  DEFAULT_RETRY_CONFIG,
+} from "./retry";
+export type { RetryConfig } from "./types";
 
 // Client SDK
 export { AnonVoteClient } from "./client";
+export type { SerializedElection } from "./client";
 
-// Crypto-primitive types (canonical, required by the issue)
-export type {
-  EncryptedPayload,
-  Token,
-  Vote,
-  ElectionResult,
-  BallotEvent,
-} from "./types";
-export { AnonVoteCryptoError } from "./types";
+// Error types
+export { AnonVoteError, ValidationError, CryptoError } from "./errors";
 
-// Core / ecosystem types
+// Core types
 export type {
   BallotStatus,
   Option,
   Ballot,
   EligibilityList,
   EligibilityEntry,
+  Token,
   VoterToken,
-  VoteRecord,
+  EncryptedVote,
+  Vote,
+  EncryptedPayload,
   Organization,
   Result,
   AuditEventType,
@@ -44,11 +123,11 @@ export type {
   ApiResponse,
   TokenResponse,
   LoginResponse,
-  // Client SDK types
   ClientConfig,
-  CreateElectionParams,
-  CastVoteParams,
-  Election,
   ElectionOption,
+  CreateElectionParams,
+  Election,
+  CastVoteParams,
   VoteReceipt,
 } from "./types";
+

@@ -31,3 +31,20 @@ npm-debug.log*
 
 # Documentation that shouldn't be in the package
 DECISIONS.md
+# Exclude tests
+tests/
+
+# Exclude source files (only dist/ should be published)
+src/
+
+# Exclude build configuration
+tsconfig.json
+jest.config.js
+typedoc.json
+
+# Exclude generated TypeDoc site
+docs/
+
+# Exclude source maps
+*.js.map
+*.d.ts.map

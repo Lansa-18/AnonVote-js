@@ -1,16 +1,35 @@
-import { randomBytes } from "crypto";
-import { encryptVote, decryptVote } from "./crypto";
+import { getRandomBytes, bytesToHex } from "./random";
+import {
+  encryptVote,
+  decryptVote,
+  encryptVoteHomomorphic,
+  verifyVoteZKP,
+  tallyHomomorphic,
+  verifyHomomorphicTallyProof,
+} from "./crypto";
+import { ValidationError } from "./errors";
+import { withRetry, resolveRetryConfig } from "./retry";
 import type {
   Election,
   ElectionOption,
   VoteReceipt,
   ClientConfig,
+  RetryConfig,
   CreateElectionParams,
   CastVoteParams,
+  EncryptedPayload,
+  PaillierPublicKey,
+  PaillierPrivateKey,
+  HomomorphicEncryptedVote,
+  TallyDecryptionProof,
+  ZKPVerificationReport,
 } from "./types";
 
 /**
  * Serialized election payload suitable for APIs or blockchain transactions.
+ *
+ * All date fields are ISO 8601 strings. This interface mirrors {@link Election}
+ * but guarantees JSON-safe output (no `Date` objects).
  */
 export interface SerializedElection {
   id: string;
@@ -23,20 +42,21 @@ export interface SerializedElection {
 }
 
 /**
- * AnonVoteClient - The primary SDK interface for interacting with AnonVote.
+ * The primary SDK interface for interacting with AnonVote.
  *
- * This client provides a minimal, consistent, and framework-agnostic API
- * for creating elections, casting votes, and verifying results. It hides
- * internal implementation details like cryptographic primitives and
- * payload serialization.
+ * `AnonVoteClient` provides a minimal, consistent, and framework-agnostic API
+ * for creating elections, casting votes, verifying encrypted payloads, and
+ * serializing/deserializing election objects. It encapsulates all cryptographic
+ * operations so callers never need to handle raw keys or payloads directly.
  *
  * @example
  * ```typescript
+ * import { AnonVoteClient } from "@anonvote/crypto";
+ *
  * const client = new AnonVoteClient({
  *   encryptionKey: process.env.BALLOT_ENCRYPTION_KEY!,
  * });
  *
- * // Create an election
  * const election = client.createElection({
  *   title: "Board Election 2024",
  *   description: "Elect the new board members",
@@ -45,75 +65,150 @@ export interface SerializedElection {
  *   endTime: Date.now() + 7 * 24 * 60 * 60 * 1000,
  * });
  *
- * // Cast a vote
  * const receipt = client.castVote({
  *   ballotId: election.id,
  *   voteOption: election.options[0].text,
- *   encryptionKey: process.env.BALLOT_ENCRYPTION_KEY!,
  * });
  *
- * // Verify a vote
- * const isValid = client.verifyVote(receipt.encryptedPayload, process.env.BALLOT_ENCRYPTION_KEY!);
+ * const isValid = client.verifyVote(receipt.encryptedPayload);
  * ```
  */
 export class AnonVoteClient {
   private readonly config: ClientConfig;
+  private readonly retryConfig: RetryConfig;
 
   /**
-   * Creates a new AnonVoteClient instance.
+   * Optional callback invoked before each retry attempt. Receives the
+   * 1-based attempt number, the computed backoff delay in milliseconds, and
+   * the error that caused the retry. Override this on the instance to add
+   * custom logging without violating the no-console lint rule.
    *
-   * @param config - The client configuration options. If not provided,
-   *                 an empty config is used and encryptionKey must be
-   *                 provided explicitly in method calls.
+   * @example
+   * ```typescript
+   * const client = new AnonVoteClient({ encryptionKey: key });
+   * client.onRetry = (attempt, delayMs, error) => {
+   *   myLogger.warn(`Retry attempt ${attempt} after ${delayMs}ms`, error);
+   * };
+   * ```
+   */
+  onRetry?: (attempt: number, delayMs: number, error: unknown) => void;
+
+  /**
+   * Creates a new `AnonVoteClient` instance.
+   *
+   * @param config - Optional client configuration. When `encryptionKey` is
+   *                 provided here it is used as the default for all operations
+   *                 that require a key; individual method calls can override it.
+   *                 If omitted, an `encryptionKey` must be supplied explicitly
+   *                 in each method call that requires one.
    */
   constructor(config: ClientConfig = {}) {
     this.config = config;
+    this.retryConfig = resolveRetryConfig(config.retryConfig);
+  }
+
+  /**
+   * Executes an async operation with automatic retry and exponential backoff
+   * using the client's configured {@link RetryConfig}.
+   *
+   * Useful for wrapping HTTP calls that talk to the AnonVote backend:
+   *
+   * @example
+   * ```typescript
+   * const result = await client.execute(() =>
+   *   fetch(`${apiUrl}/ballots`, { method: "POST", body: JSON.stringify(data) })
+   *     .then(async (res) => {
+   *       if (!res.ok) throw new HttpError(res.status, res.statusText);
+   *       return res.json();
+   *     })
+   * );
+   * ```
+   *
+   * @param operation - Async operation to execute and potentially retry.
+   * @returns The resolved value of the operation.
+   */
+  execute<T>(operation: () => Promise<T>): Promise<T> {
+    return withRetry(operation, this.retryConfig, this.onRetry?.bind(this));
   }
 
   /**
    * Creates a new election object.
    *
-   * @param params - The election creation parameters.
-   * @returns A strongly typed Election object.
-   * @throws Error if the election data is invalid.
+   * Validates all inputs, generates a unique election ID, assigns IDs to each
+   * option, and returns a fully formed {@link Election} ready for storage or
+   * submission.
+   *
+   * @param params - The election creation parameters including title,
+   *                 description, options array, and start/end times.
+   * @returns A strongly typed {@link Election} object.
+   * @throws {@link ValidationError} if `title` or `description` is empty, if
+   *         `options` is empty or contains blank entries, if `startTime` or
+   *         `endTime` is not a valid date or timestamp, or if `endTime` is not
+   *         after `startTime`.
+   *
+   * @example
+   * ```typescript
+   * const election = client.createElection({
+   *   title: "Q1 Budget Vote",
+   *   description: "Approve or reject the Q1 budget proposal.",
+   *   options: ["Approve", "Reject"],
+   *   startTime: "2024-03-01T00:00:00Z",
+   *   endTime: "2024-03-08T00:00:00Z",
+   * });
+   * ```
    */
   createElection(params: CreateElectionParams): Election {
     // Validate title
-    if (!params.title || (typeof params.title === "string" && params.title.trim().length === 0)) {
-      throw new Error("Election title is required");
+    if (
+      !params.title ||
+      (typeof params.title === "string" && params.title.trim().length === 0)
+    ) {
+      throw new ValidationError("Election title is required");
     }
 
     // Validate description
-    if (!params.description || (typeof params.description === "string" && params.description.trim().length === 0)) {
-      throw new Error("Election description is required");
+    if (
+      !params.description ||
+      (typeof params.description === "string" &&
+        params.description.trim().length === 0)
+    ) {
+      throw new ValidationError("Election description is required");
     }
 
     // Validate options
-    if (!params.options || !Array.isArray(params.options) || params.options.length === 0) {
-      throw new Error("At least one voting option is required");
+    if (
+      !params.options ||
+      !Array.isArray(params.options) ||
+      params.options.length === 0
+    ) {
+      throw new ValidationError("At least one voting option is required");
     }
 
     // Validate each option is non-empty
     for (const opt of params.options) {
       if (!opt || (typeof opt === "string" && opt.trim().length === 0)) {
-        throw new Error("Voting options cannot be empty strings");
+        throw new ValidationError("Voting options cannot be empty strings");
       }
     }
 
     // Validate startTime
     const startTimeMs = this.parseTimestamp(params.startTime);
     if (isNaN(startTimeMs)) {
-      throw new Error("Invalid startTime: must be a valid date or timestamp");
+      throw new ValidationError(
+        "Invalid startTime: must be a valid date or timestamp",
+      );
     }
 
     // Validate endTime
     const endTimeMs = this.parseTimestamp(params.endTime);
     if (isNaN(endTimeMs)) {
-      throw new Error("Invalid endTime: must be a valid date or timestamp");
+      throw new ValidationError(
+        "Invalid endTime: must be a valid date or timestamp",
+      );
     }
 
     if (endTimeMs <= startTimeMs) {
-      throw new Error("endTime must be after startTime");
+      throw new ValidationError("endTime must be after startTime");
     }
 
     const now = new Date();
@@ -123,15 +218,23 @@ export class AnonVoteClient {
     const id = this.generateId("elec");
 
     // Create options with generated IDs
-    const electionOptions: ElectionOption[] = params.options.map((text, index) => ({
-      id: this.generateId(`option-${index}`),
-      text: text.trim(),
-    }));
+    const electionOptions: ElectionOption[] = params.options.map(
+      (text, index) => ({
+        id: this.generateId(`option-${index}`),
+        text: text.trim(),
+      }),
+    );
 
     return {
       id,
-      title: typeof params.title === "string" ? params.title.trim() : String(params.title),
-      description: typeof params.description === "string" ? params.description.trim() : String(params.description),
+      title:
+        typeof params.title === "string"
+          ? params.title.trim()
+          : String(params.title),
+      description:
+        typeof params.description === "string"
+          ? params.description.trim()
+          : String(params.description),
       options: electionOptions,
       startTime: new Date(startTimeMs).toISOString(),
       endTime: new Date(endTimeMs).toISOString(),
@@ -140,34 +243,57 @@ export class AnonVoteClient {
   }
 
   /**
-   * Casts a vote for a specific option.
+   * Casts a vote for a specific option in an election.
    *
-   * This method validates the vote, encrypts it using @anonvote/crypto,
-   * and returns the encrypted payload ready for submission.
+   * Validates all inputs, encrypts the selected option using AES-256-GCM via
+   * {@link encryptVote}, and returns a {@link VoteReceipt} containing the
+   * encrypted payload ready for submission.
    *
-   * @param params - The vote casting parameters.
-   * @returns A VoteReceipt confirming the vote was cast.
-   * @throws Error if required parameters are missing.
+   * @param params - The vote casting parameters: `ballotId`, `voteOption`, and
+   *                 an optional `encryptionKey` (falls back to the key in the
+   *                 client config if not provided).
+   * @returns A {@link VoteReceipt} containing the encrypted payload, receipt ID,
+   *          and timestamp.
+   * @throws {@link ValidationError} if `ballotId` or `voteOption` is empty, or
+   *         if no `encryptionKey` is available from params or client config.
+   * @throws {@link ValidationError} if the resolved `encryptionKey` is not a
+   *         valid 64-character hex string (propagated from {@link encryptVote}).
+   *
+   * @example
+   * ```typescript
+   * const receipt = client.castVote({
+   *   ballotId: election.id,
+   *   voteOption: "Alice",
+   * });
+   * // receipt.encryptedPayload contains the AES-256-GCM ciphertext
+   * ```
    */
   castVote(params: CastVoteParams): VoteReceipt {
-    if (!params.ballotId || (typeof params.ballotId === "string" && params.ballotId.trim().length === 0)) {
-      throw new Error("ballotId is required");
+    if (
+      !params.ballotId ||
+      (typeof params.ballotId === "string" &&
+        params.ballotId.trim().length === 0)
+    ) {
+      throw new ValidationError("ballotId is required");
     }
 
-    if (!params.voteOption || (typeof params.voteOption === "string" && params.voteOption.trim().length === 0)) {
-      throw new Error("voteOption is required");
+    if (
+      !params.voteOption ||
+      (typeof params.voteOption === "string" &&
+        params.voteOption.trim().length === 0)
+    ) {
+      throw new ValidationError("voteOption is required");
     }
 
     const encryptionKey = params.encryptionKey || this.config.encryptionKey;
     if (!encryptionKey) {
-      throw new Error("encryptionKey is required either in params or client config");
+      throw new ValidationError(
+        "encryptionKey is required either in params or client config",
+      );
     }
 
-    // Encrypt the vote — serialise the EncryptedPayload object to a JSON string
-    // so it fits the VoteReceipt.encryptedPayload string field.
-    const encryptedPayload = JSON.stringify(
-      encryptVote(params.voteOption.trim(), encryptionKey),
-    );
+    // Encrypt the vote
+    const encryptedVote = encryptVote(params.voteOption.trim(), encryptionKey);
 
     const id = this.generateId("receipt");
     const castAt = new Date().toISOString();
@@ -176,25 +302,42 @@ export class AnonVoteClient {
       id,
       electionId: params.ballotId,
       ballotId: params.ballotId,
-      encryptedPayload,
+      encryptedPayload: encryptedVote,
       castAt,
       verified: false,
     };
   }
 
   /**
-   * Verifies an encrypted vote payload.
+   * Verifies that an encrypted vote payload is valid and can be decrypted.
    *
-   * This method attempts to decrypt and validate the payload,
-   * returning a boolean indicating whether the payload is valid.
+   * Attempts to decrypt the payload using the provided or configured encryption
+   * key. Returns `true` if decryption succeeds and produces a non-empty string;
+   * returns `false` for any failure including missing fields, missing key, or
+   * authentication tag mismatch.
    *
-   * @param encryptedPayload - The encrypted vote payload to verify.
-   * @param encryptionKey - The encryption key to use for verification.
-   *                        If not provided, uses the client config key.
-   * @returns true if the payload can be successfully decrypted and validated.
+   * @param encryptedPayload - The {@link EncryptedPayload} to verify, as
+   *                           returned by {@link castVote}.
+   * @param encryptionKey    - Optional 64-character hex key. Falls back to the
+   *                           key supplied in the client config.
+   * @returns `true` if the payload decrypts successfully; `false` otherwise.
+   *
+   * @example
+   * ```typescript
+   * const isValid = client.verifyVote(receipt.encryptedPayload);
+   * console.log(isValid); // true
+   * ```
    */
-  verifyVote(encryptedPayload: string, encryptionKey?: string): boolean {
-    if (!encryptedPayload || encryptedPayload.trim().length === 0) {
+  verifyVote(
+    encryptedPayload: EncryptedPayload,
+    encryptionKey?: string,
+  ): boolean {
+    if (
+      !encryptedPayload ||
+      !encryptedPayload.ciphertext ||
+      !encryptedPayload.iv ||
+      !encryptedPayload.authTag
+    ) {
       return false;
     }
 
@@ -204,9 +347,7 @@ export class AnonVoteClient {
     }
 
     try {
-      // encryptedPayload is stored as a JSON-serialised EncryptedPayload object
-      const parsed = JSON.parse(encryptedPayload.trim());
-      const decrypted = decryptVote(parsed, key);
+      const decrypted = decryptVote(encryptedPayload, key);
       // If decryption succeeded, the payload is valid
       return typeof decrypted === "string" && decrypted.length > 0;
     } catch {
@@ -216,15 +357,90 @@ export class AnonVoteClient {
   }
 
   /**
-   * Serializes an Election object to a JSON-safe payload.
+   * Casts a homomorphic vote with a Zero-Knowledge Proof (NIZK).
    *
-   * @param election - The Election object to serialize.
-   * @returns A serialized payload suitable for APIs or blockchain transactions.
-   * @throws Error if the election is invalid.
+   * @param params - Vote parameters including optionIndex, totalOptions, ballotId, and publicKey.
+   * @returns {@link HomomorphicEncryptedVote}
+   */
+  castVoteHomomorphic(params: {
+    ballotId: string;
+    optionIndex: number;
+    totalOptions: number;
+    publicKey: PaillierPublicKey;
+  }): HomomorphicEncryptedVote {
+    if (!params.ballotId || params.ballotId.trim().length === 0) {
+      throw new ValidationError("ballotId is required");
+    }
+    if (params.optionIndex < 0 || params.optionIndex >= params.totalOptions) {
+      throw new ValidationError("optionIndex out of bounds");
+    }
+    if (!params.publicKey) {
+      throw new ValidationError("publicKey is required");
+    }
+
+    return encryptVoteHomomorphic(
+      params.optionIndex,
+      params.totalOptions,
+      params.ballotId,
+      params.publicKey,
+    );
+  }
+
+  /**
+   * Verifies a Zero-Knowledge Proof attached to an encrypted vote.
+   *
+   * @param vote - Homomorphic encrypted vote
+   * @param publicKey - Paillier public key
+   */
+  verifyVoteZKP(
+    vote: HomomorphicEncryptedVote,
+    publicKey: PaillierPublicKey,
+  ): ZKPVerificationReport {
+    return verifyVoteZKP(vote, publicKey);
+  }
+
+  /**
+   * Homomorphically aggregates encrypted votes into a verifiable tally result.
+   */
+  tallyHomomorphic(
+    votes: HomomorphicEncryptedVote[],
+    publicKey: PaillierPublicKey,
+    privateKey: PaillierPrivateKey,
+    merkleRoot = "",
+  ): TallyDecryptionProof {
+    return tallyHomomorphic(votes, publicKey, privateKey, merkleRoot);
+  }
+
+  /**
+   * Verifies a homomorphic tally decryption proof.
+   */
+  verifyTallyProof(
+    proof: TallyDecryptionProof,
+    publicKey: PaillierPublicKey,
+  ): boolean {
+    return verifyHomomorphicTallyProof(proof, publicKey);
+  }
+
+  /**
+   * Serializes an {@link Election} object to a JSON-safe payload.
+   *
+   * Produces a {@link SerializedElection} where all date fields are ISO 8601
+   * strings. Suitable for storing in a database, sending over an API, or
+   * submitting to a blockchain transaction.
+   *
+   * @param election - The {@link Election} object to serialize.
+   * @returns A {@link SerializedElection} with all fields as plain strings.
+   * @throws {@link ValidationError} if `election` is not a valid object.
+   *
+   * @example
+   * ```typescript
+   * const payload = client.serialize(election);
+   * const json = JSON.stringify(payload);
+   * ```
    */
   serialize(election: Election): SerializedElection {
     if (!election || typeof election !== "object") {
-      throw new Error("Invalid election object");
+      throw new ValidationError("Invalid election object");
     }
 
     return {
@@ -239,54 +455,71 @@ export class AnonVoteClient {
   }
 
   /**
-   * Deserializes an Election object from a JSON payload.
+   * Deserializes a {@link SerializedElection} payload back into an
+   * {@link Election} object.
    *
-   * @param payload - The serialized election payload.
-   * @returns A strongly typed Election object.
-   * @throws Error if the payload is invalid.
+   * Validates all required fields and their types before returning. Useful for
+   * reconstructing an election from a stored JSON payload or an API response.
+   *
+   * @param payload - The {@link SerializedElection} payload to deserialize.
+   * @returns A strongly typed {@link Election} object.
+   * @throws {@link ValidationError} if `payload` is not a valid object, or if
+   *         any required field (`id`, `title`, `description`, `options`,
+   *         `startTime`, `endTime`, `createdAt`) is missing or of the wrong type.
+   *
+   * @example
+   * ```typescript
+   * const election = client.deserialize(JSON.parse(storedJson));
+   * ```
    */
   deserialize(payload: SerializedElection): Election {
     if (!payload || typeof payload !== "object") {
-      throw new Error("Invalid election object");
+      throw new ValidationError("Invalid election object");
     }
 
     // Validate required fields
     if (!payload.id || typeof payload.id !== "string") {
-      throw new Error("Invalid payload: missing or invalid id");
+      throw new ValidationError("Invalid payload: missing or invalid id");
     }
 
     if (!payload.title || typeof payload.title !== "string") {
-      throw new Error("Invalid payload: missing or invalid title");
+      throw new ValidationError("Invalid payload: missing or invalid title");
     }
 
     if (!payload.description || typeof payload.description !== "string") {
-      throw new Error("Invalid payload: missing or invalid description");
+      throw new ValidationError(
+        "Invalid payload: missing or invalid description",
+      );
     }
 
     if (!Array.isArray(payload.options)) {
-      throw new Error("Invalid payload: missing or invalid options");
+      throw new ValidationError("Invalid payload: missing or invalid options");
     }
 
     // Validate each option has id and text
     for (const opt of payload.options) {
       if (!opt.id || typeof opt.id !== "string") {
-        throw new Error("Invalid payload: option missing id");
+        throw new ValidationError("Invalid payload: option missing id");
       }
       if (!opt.text || typeof opt.text !== "string") {
-        throw new Error("Invalid payload: option missing text");
+        throw new ValidationError("Invalid payload: option missing text");
       }
     }
 
     if (!payload.startTime || typeof payload.startTime !== "string") {
-      throw new Error("Invalid payload: missing or invalid startTime");
+      throw new ValidationError(
+        "Invalid payload: missing or invalid startTime",
+      );
     }
 
     if (!payload.endTime || typeof payload.endTime !== "string") {
-      throw new Error("Invalid payload: missing or invalid endTime");
+      throw new ValidationError("Invalid payload: missing or invalid endTime");
     }
 
     if (!payload.createdAt || typeof payload.createdAt !== "string") {
-      throw new Error("Invalid payload: missing or invalid createdAt");
+      throw new ValidationError(
+        "Invalid payload: missing or invalid createdAt",
+      );
     }
 
     return {
@@ -303,8 +536,10 @@ export class AnonVoteClient {
   /**
    * Parses a timestamp value (string or number) into milliseconds.
    *
-   * @param value - The timestamp value to parse.
-   * @returns The timestamp in milliseconds, or NaN if invalid.
+   * @param value - A Unix timestamp in milliseconds (number), an ISO 8601 date
+   *                string, or a numeric string representing milliseconds.
+   * @returns The timestamp in milliseconds, or `NaN` if the value cannot be
+   *          parsed.
    */
   private parseTimestamp(value: string | number): number {
     if (typeof value === "number") {
@@ -325,16 +560,15 @@ export class AnonVoteClient {
   }
 
   /**
-   * Generates a unique identifier with an optional prefix.
+   * Generates a unique identifier with a given prefix.
    *
-   * @param prefix - Optional prefix for the ID.
-   * @returns A unique ID string.
+   * @param prefix - A short string prepended to the UUID (e.g. `"elec"`,
+   *                 `"receipt"`).
+   * @returns A string in the form `"<prefix>-<uuid>"` where the UUID is derived
+   *          from 16 cryptographically random bytes.
    */
   private generateId(prefix: string): string {
-    const bytes = randomBytes(16);
-    const hex = Array.from(bytes as unknown as number[])
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
+    const hex = bytesToHex(getRandomBytes(16));
 
     const uuid = [
       hex.slice(0, 8),
