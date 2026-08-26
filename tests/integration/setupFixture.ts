@@ -106,6 +106,42 @@ function delay(ms: number, signal?: AbortSignal | null): Promise<void> {
   });
 }
 
+/**
+ * Rejects with an AbortError as soon as `signal` fires, whatever `promise` is
+ * still doing. The loser's rejection is swallowed so a stalled or failing
+ * server-side promise cannot surface as an unhandled rejection after the
+ * caller has already given up on it.
+ */
+function withAbort<T>(
+  promise: Promise<T>,
+  signal?: AbortSignal | null,
+): Promise<T> {
+  if (!signal) return promise;
+
+  return new Promise<T>((resolve, reject) => {
+    if (signal.aborted) {
+      promise.catch(() => {});
+      reject(abortError());
+      return;
+    }
+    const onAbort = (): void => {
+      promise.catch(() => {});
+      reject(abortError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (err) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
 function headersToRecord(init: RequestInit): Record<string, string> {
   const raw = init.headers;
   if (!raw) return {};
@@ -184,24 +220,30 @@ export function installFetchMock(
     calls.push({ method, url, path, headers, body: parsedBody });
 
     const signal = init.signal ?? null;
-    if (latencyMs > 0) {
-      await delay(latencyMs, signal);
-    } else if (signal?.aborted) {
-      throw abortError();
-    }
 
-    if (networkFailuresRemaining > 0) {
-      networkFailuresRemaining -= 1;
-      throw networkError;
-    }
+    const respond = async (): Promise<Response> => {
+      if (latencyMs > 0) {
+        await delay(latencyMs, signal);
+      }
 
-    if (forcedRemaining > 0) {
-      forcedRemaining -= 1;
-      return jsonResponse(forcedStatus, forcedBody);
-    }
+      if (networkFailuresRemaining > 0) {
+        networkFailuresRemaining -= 1;
+        throw networkError;
+      }
 
-    const result = await backend.handle(method, path, parsedBody, headers);
-    return jsonResponse(result.status, result.body);
+      if (forcedRemaining > 0) {
+        forcedRemaining -= 1;
+        return jsonResponse(forcedStatus, forcedBody);
+      }
+
+      const result = await backend.handle(method, path, parsedBody, headers);
+      return jsonResponse(result.status, result.body);
+    };
+
+    // Real fetch rejects the moment the signal aborts, however deep the server
+    // is into handling the request. Racing here rather than only around the
+    // latency delay is what makes a stalled backend observable as a timeout.
+    return withAbort(respond(), signal);
   };
 
   globalThis.fetch = mockFetch as unknown as typeof globalThis.fetch;

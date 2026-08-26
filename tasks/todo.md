@@ -9,10 +9,30 @@ Branch: `feat/issue-79-integration-test-suite`
 - [x] `tests/integration/setupFixture.ts` — fetch mock install/restore, factories, shared lazy 128-bit Paillier keypair
 - [x] `tests/integration/voteLifecycleSimulator.ts` — createBallot → issueTokens → castVotes → tallyVotes → verifyResult
 
-## Phase 2 — Scenarios (22 planned, 25 tests shipped)
+## Post-implementation audit
+
+Re-read `plan.md` against the shipped code. All 22 planned scenarios were
+present, but the audit found the plan's file table under-delivered in one place:
+
+- [x] **`mockStellarNetwork.readTransaction()` was dead code** — required by the
+  plan's file table, called by no test. Now exercised in happy-path scenario 1
+  (reads a vote back by txId, asserts the ledger holds the token *hash* not the
+  raw token, and that an unknown txId returns null).
+- [x] **Failure injection was dead code** — the plan required timeout /
+  contract-error / tx-failed injection; none of the three ran. Now covered by
+  three new tests in `error-handling.test.ts`.
+- [x] `getSequence()`, `getStoredBallot()`, `callCount()` were also unreferenced;
+  all now carry real assertions.
+- [x] **Fidelity bug found by the new tests**: the `fetch` mock only honoured
+  `AbortSignal` during its artificial latency, so an abort firing while the
+  simulated backend was mid-handler never rejected — unlike real `fetch`. Fixed
+  with a `withAbort()` race in `setupFixture.ts`. Without this, a stalled
+  backend was silently untestable.
+
+## Phase 2 — Scenarios (22 planned, 28 tests shipped)
 
 - [x] `happy-path.test.ts` — 1-3
-- [x] `error-handling.test.ts` — 4-9, plus a 404 mapping test and the retry-amplification documentation test
+- [x] `error-handling.test.ts` — 4-9, plus a 404 mapping test, three ledger-failure tests, and the retry-amplification documentation test
 - [x] `concurrency.test.ts` — 10-12
 - [x] `ballot-state-machine.test.ts` — 13-17, plus the root-client time-gating documentation test
 - [x] `encryption-pipeline.test.ts` — 18-22
@@ -32,17 +52,19 @@ Run on Node 24.16.0, 2026-08-26.
 
 - [x] `npm run lint` — exit 0, no errors
 - [x] `npm test` — 338 passing, 15 suites; identical to before, so integration is genuinely excluded
-- [x] `npm run test:integration` — 25 passing, 5 suites, **0.73 s** (ceiling was 5 s)
-- [x] `npm run test:integration:stress` — 2 passing, 0.71 s
+- [x] `npm run test:integration` — 28 passing, 5 suites, **0.59 s** (ceiling was 5 s)
+- [x] `npm run test:integration:stress` — 2 passing, 0.50 s
+- [x] `package.json` devDependencies duplicate keys left undisturbed, as the plan required
 - [x] `npm run build` — clean; no integration files in `dist/`
 - [x] Deliberately broken integration assertion → `test:integration` 1 failed / 24 passed, `npm test` still 338 passing
 
 ## Review
 
 **What shipped.** Four infrastructure modules and six test files under
-`tests/integration/`, plus two Jest configs, two npm scripts, and one CI step.
-No `src/` change of any kind — the suite reaches the previously-untestable HTTP
-client by direct path import rather than by widening the public API.
+`tests/integration/` (28 fast-tier tests + 2 stress), plus two Jest configs, two
+npm scripts, and one CI step. No `src/` change of any kind — the suite reaches
+the previously-untestable HTTP client by direct path import rather than by
+widening the public API.
 
 **What it actually covers.** Before this, `tests/AnonVoteClient.test.ts` was a
 one-assertion placeholder and nothing in the repo mocked `fetch`, so the whole

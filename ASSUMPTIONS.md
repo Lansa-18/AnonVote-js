@@ -27,8 +27,10 @@ _Recorded 2026-08-26._
 
 2. **Every scenario is labelled `[real]` or `[harness]`** in the test files.
    `[real]` asserts on library behaviour; `[harness]` asserts on the simulator's
-   own state machine. 18 of 22 scenarios are `[real]`. If that ratio drifts, the
-   suite is drifting towards testing its own mocks.
+   own state machine. Of the 28 fast-tier tests, only three are purely
+   `[harness]` (tally-snapshot consistency, results-before-tally, re-tally
+   refusal). If that ratio drifts, the suite is drifting towards testing its own
+   mocks.
 
 3. **The mock backend holds the AES ballot key** so it can decrypt at tally
    time. A production backend must never hold it. Here it stands in for the
@@ -57,13 +59,29 @@ _Recorded 2026-08-26._
    `setupFixture.sharedPaillierKeys()`. Key generation dominates the runtime
    budget. Production default is 2048 and must never be used in tests.
 
-8. **No new runtime or dev dependencies.** No `nock`, no `msw` — the hand-rolled
+8. **The `fetch` mock races every response against the `AbortSignal`,** not just
+   its artificial latency. Real `fetch` rejects the instant the signal fires,
+   however deep the server is into handling the request; an earlier version of
+   the mock only checked the signal around its own delay, which made a stalled
+   backend silently untestable. The loser of the race has its rejection
+   swallowed so an abandoned server-side promise cannot surface later as an
+   unhandled rejection.
+
+9. **A client-side timeout is not a rollback.** `MockBackend.submitVote`
+   consumes the token synchronously before touching the ledger, and the
+   compensating rollback sits after an `await`. If the ledger never settles, the
+   token stays consumed even though no vote was anchored. This is deliberate and
+   asserted: it mirrors the real hazard that a timed-out write may still land,
+   and is the argument for making vote submission idempotent rather than
+   at-most-once.
+
+10. **No new runtime or dev dependencies.** No `nock`, no `msw` — the hand-rolled
    `fetch` mock in `setupFixture.ts` is about 60 lines and keeps this a
    zero-dependency package. Real `Response` objects (undici, Node 20+) are
    constructed so `res.ok`, `res.status` and `res.json()` behave as in
    production.
 
-9. **`src/client/AnonVoteClient.ts` is imported by direct path.** It is not
+11. **`src/client/AnonVoteClient.ts` is imported by direct path.** It is not
    re-exported from either package entry point, so this is the only way to reach
    it. No public API was changed to make it testable.
 
@@ -73,7 +91,7 @@ Both are recorded as explicitly-named documentation tests asserting the
 **observed** behaviour, so a future fix is a deliberate, visible change to the
 test rather than a silent one.
 
-10. **Retry amplification on domain errors.** `isRetryable`
+12. **Retry amplification on domain errors.** `isRetryable`
     (`src/retry.ts:109-115`) returns `error instanceof Error` for anything that
     is not an `HttpError`. `throwForStatus` maps 409/410/422 to
     `InvalidTokenError`/`BallotClosedError`, which extend `AnonVoteError`, not
@@ -81,7 +99,7 @@ test rather than a silent one.
     of one. Pinned by `[known defect] retries a non-retryable 409 …` in
     `tests/integration/error-handling.test.ts`.
 
-11. **Only one of three clients gates voting by time.** `src/client/index.ts`
+13. **Only one of three clients gates voting by time.** `src/client/index.ts`
     enforces the election window; the root `src/client.ts` (`castVote`,
     lines 271-309) has no time or status check and will happily encrypt a vote
     for an election that closed a year ago. `BallotStatus` in `src/types.ts` is

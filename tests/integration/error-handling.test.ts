@@ -147,6 +147,106 @@ describe("integration: error handling", () => {
     ).rejects.toBeInstanceOf(BallotNotFoundError);
   });
 
+  // ── Ledger failure injection ─────────────────────────────────────────────
+
+  // [real] on the retry/500 path; [harness] on the compensating rollback.
+  it("rolls the token back when the ledger rejects the transaction", async () => {
+    const sim = new VoteLifecycleSimulator(fixture, {
+      retryConfig: { maxRetries: 1 },
+    });
+
+    const ballot = await sim.createBallot();
+    const tokens = await sim.issueTokens(1);
+    const sequenceBefore = fixture.ledger.getSequence();
+    fixture.fetchMock.reset();
+
+    fixture.ledger.injectFailure("contract-error");
+
+    // [harness] the ledger itself reports a typed, discriminated failure.
+    await expect(
+      fixture.ledger.submitTransaction({
+        type: "RECORD_VOTE",
+        ballotId: ballot.id,
+        tokenHash: "0".repeat(64),
+        payload: {},
+      }),
+    ).rejects.toMatchObject({ name: "LedgerError", kind: "contract-error" });
+
+    await expect(
+      sim.client.submitVote(ballot.id, tokens[0], ballot.options[0].id),
+    ).rejects.toMatchObject({
+      name: "HttpError",
+      statusCode: 500,
+      // The LedgerError message survives the backend's 500 envelope.
+      message: expect.stringContaining("Soroban contract rejected"),
+    });
+
+    // 500 is in retryableStatusCodes, so maxRetries + 1 attempts were made.
+    expect(fixture.fetchMock.callsTo("/votes")).toHaveLength(2);
+
+    // Nothing was anchored and the ledger did not advance.
+    expect(fixture.ledger.countVotes(ballot.id)).toBe(0);
+    expect(fixture.ledger.getSequence()).toBe(sequenceBefore);
+
+    // The token was never actually spent — the voter can still use it.
+    expect(fixture.backend.allTokensUsed(ballot.id)).toBe(false);
+    fixture.ledger.injectFailure("none");
+    await expect(
+      sim.client.submitVote(ballot.id, tokens[0], ballot.options[0].id),
+    ).resolves.toMatchObject({ ballotId: ballot.id });
+    expect(fixture.ledger.countVotes(ballot.id)).toBe(1);
+  });
+
+  it("recovers when a transient ledger failure clears after one attempt", async () => {
+    const sim = new VoteLifecycleSimulator(fixture, {
+      retryConfig: { maxRetries: 3 },
+    });
+
+    const ballot = await sim.createBallot();
+    const tokens = await sim.issueTokens(1);
+    fixture.fetchMock.reset();
+
+    // Fails once, then the ledger is healthy again.
+    fixture.ledger.injectFailure("tx-failed", 1);
+
+    const receipt = await sim.client.submitVote(
+      ballot.id,
+      tokens[0],
+      ballot.options[0].id,
+    );
+
+    expect(receipt.ballotId).toBe(ballot.id);
+    expect(fixture.fetchMock.callsTo("/votes")).toHaveLength(2);
+    expect(fixture.ledger.countVotes(ballot.id)).toBe(1);
+  });
+
+  it("times out client-side when the ledger never settles", async () => {
+    const sim = new VoteLifecycleSimulator(fixture, {
+      timeoutMs: 25,
+      retryConfig: { maxRetries: 0 },
+    });
+
+    const ballot = await sim.createBallot();
+    const tokens = await sim.issueTokens(1);
+    const callsBefore = fixture.fetchMock.callCount();
+
+    fixture.ledger.injectFailure("timeout");
+
+    await expect(
+      sim.client.submitVote(ballot.id, tokens[0], ballot.options[0].id),
+    ).rejects.toBeInstanceOf(TimeoutError);
+
+    expect(fixture.fetchMock.callCount()).toBe(callsBefore + 1);
+    expect(fixture.ledger.countVotes(ballot.id)).toBe(0);
+
+    // HONEST ASYMMETRY, not a harness bug: the token is consumed before the
+    // ledger is touched, and the rollback lives after the await that never
+    // settles. A client-side timeout says nothing about whether the write
+    // eventually lands — which is exactly the real-world hazard, and the
+    // reason vote submission needs to be idempotent rather than at-most-once.
+    expect(fixture.backend.allTokensUsed(ballot.id)).toBe(true);
+  });
+
   /**
    * DOCUMENTATION TEST — pins a known defect, does not endorse it.
    *

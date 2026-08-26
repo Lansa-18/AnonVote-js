@@ -64,6 +64,24 @@ describe("integration: happy path", () => {
     expect(ledgerVotes).toHaveLength(5);
     expect(new Set(ledgerVotes.map((v) => v.txId)).size).toBe(5);
 
+    // Each anchored vote reads back by transaction ID, carrying the token
+    // *hash* — never the raw token — and the opaque payload.
+    const readBack = await fixture.ledger.readTransaction(ledgerVotes[0].txId);
+    expect(readBack).toMatchObject({
+      txId: ledgerVotes[0].txId,
+      ballotId: ballot.id,
+      tokenHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+    expect(JSON.stringify(readBack)).not.toContain(tokens[0]);
+    await expect(fixture.ledger.readTransaction("tx_does_not_exist")).resolves.
+      toBeNull();
+
+    // Server-side bookkeeping tracks the same numbers the ledger does.
+    const serverBallot = fixture.backend.getStoredBallot(ballot.id);
+    expect(serverBallot.votesCast).toBe(5);
+    expect(serverBallot.tokensIssued).toBe(5);
+    expect(serverBallot.eligibleVoters).toBe(5);
+
     const results = await sim.tallyVotes();
     expect(results.totalVotes).toBe(5);
     expect(sim.countsByLabel(results)).toEqual({
